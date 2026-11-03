@@ -21,6 +21,7 @@ import type {
   Balance,
   Execution,
   FinancialEvent,
+  MarketObservation,
   Order,
   Position,
   Product,
@@ -171,6 +172,7 @@ async function syncProduct(
     ))
     const symbols = await discoverSymbols(read, product, accountId, balances, failures)
     await syncSymbolHistory({ read, accountId, product, syncRunId, symbols, failures })
+    await syncMarketContext({ read, accountId, product, syncRunId, failures })
     await safely('/sapi/v1/capital/deposit/hisrec', () => syncTimeEndpoint(
       read, accountId, product, syncRunId, '/sapi/v1/capital/deposit/hisrec', '/sapi/v1/capital/deposit/hisrec',
       response => importFlows(response as { data: JsonRecord[]; endpoint: string; retrievedAt: string }, accountId, product, syncRunId, 'deposit'),
@@ -309,8 +311,165 @@ async function syncProduct(
       failures,
     )
     await syncSymbolHistory({ read, accountId, product, syncRunId, symbols, failures })
+    await syncMarketContext({ read, accountId, product, syncRunId, failures })
   }
   return imported
+}
+
+async function syncMarketContext(input: {
+  read: <T>(path: string, params?: Record<string, string | number | boolean>, signed?: boolean) => Promise<{ data: T; endpoint: string; retrievedAt: string }>
+  accountId: string
+  product: Product
+  syncRunId: string
+  failures: string[]
+}) {
+  const { read, accountId, product, syncRunId, failures } = input
+  const root = product === 'spot' ? '/api/v3' : product === 'usd-m-futures' ? '/fapi/v1' : '/dapi/v1'
+  const accountRecords = listRecords(accountId)
+  const symbolRecords = accountRecords
+    .filter(record => record.product === product && ['executions', 'orders', 'financialEvents', 'positions', 'trades'].includes(record.kind))
+    .filter(record => record.kind !== 'positions' || numeric(record.payload.quantity) !== 0)
+    .filter(record => record.kind !== 'financialEvents' || Boolean(text(record.payload.symbol)))
+    .sort((a, b) => (b.observedAt ?? '').localeCompare(a.observedAt ?? ''))
+  const historyByEndpoint = new Map<string, Map<string, string>>()
+  for (const record of accountRecords) {
+    if (record.product !== product || record.kind !== 'market') continue
+    const symbol = text(record.payload.symbol)
+    const kind = text(record.payload.kind)
+    const endpoint = symbol && kind === 'candle'
+      ? `market/klines:${symbol}`
+      : symbol && kind === 'funding-rate'
+        ? `market/funding:${symbol}`
+        : record.endpoint
+    const history = historyByEndpoint.get(endpoint) ?? new Map<string, string>()
+    history.set(record.exchangeId, record.observedAt ?? record.retrievedAt)
+    historyByEndpoint.set(endpoint, history)
+  }
+  const updateHistory = (endpoint: string, rows: StoredRecord[]) => {
+    const history = historyByEndpoint.get(endpoint) ?? new Map<string, string>()
+    for (const row of rows) history.set(row.exchangeId, row.observedAt ?? row.retrievedAt)
+    historyByEndpoint.set(endpoint, history)
+    const times = [...history.values()].sort()
+    return { recordCount: history.size, earliest: times[0] ?? null, latest: times.at(-1) ?? null }
+  }
+  const symbols = [...new Set(symbolRecords.map(record => text(record.payload.symbol)).filter((symbol): symbol is string => Boolean(symbol)))].slice(0, 20)
+  const symbolLimitReached = new Set(symbolRecords.map(record => text(record.payload.symbol)).filter((symbol): symbol is string => Boolean(symbol))).size > symbols.length
+  const candleStart = Date.now() - 365 * 24 * 60 * 60 * 1000
+  const fundingStart = Date.now() - 90 * 24 * 60 * 60 * 1000
+
+  for (const symbol of symbols) {
+    const candleEndpoint = `market/klines:${symbol}`
+    try {
+      const cursor = getEndpointCursor(accountId, product, candleEndpoint)
+      const startTime = cursor ? Math.max(candleStart, Number(cursor) - 24 * 60 * 60 * 1000) : candleStart
+      const response = await read<unknown[][]>(`${root}/klines`, { symbol, interval: '1d', startTime, limit: 1000 }, false)
+      const candles = Array.isArray(response.data) ? response.data : []
+      const observations = candles.flatMap(candle => {
+        if (!Array.isArray(candle) || candle.length < 7) return []
+        const openTime = numeric(candle[0])
+        const closeTime = numeric(candle[6])
+        if (openTime === null || closeTime === null) return []
+        const observation: MarketObservation = {
+          ...lineage(response.endpoint, response.retrievedAt),
+          id: `${symbol}:candle:1d:${openTime}`,
+          symbol,
+          product,
+          kind: 'candle',
+          observedAt: new Date(openTime).toISOString(),
+          open: numeric(candle[1]) ?? undefined,
+          high: numeric(candle[2]) ?? undefined,
+          low: numeric(candle[3]) ?? undefined,
+          close: numeric(candle[4]) ?? undefined,
+          volume: numeric(candle[5]) ?? undefined,
+          interval: '1d',
+        }
+        return [storedRecord(accountId, product, 'market', observation.id, response.endpoint, observation, observation.observedAt, response.retrievedAt, syncRunId)]
+      })
+      saveRecords(observations)
+      const history = updateHistory(candleEndpoint, observations)
+      saveMarketRaw(accountId, product, response.endpoint, symbol, startTime, response.data, response.retrievedAt, syncRunId)
+      const lastOpen = candles.length ? numeric(candles.at(-1)?.[0]) : null
+      saveEndpointResult({
+        accountId, product, endpoint: candleEndpoint, cursor: lastOpen === null ? cursor : String(lastOpen),
+        ...history, complete: !symbolLimitReached,
+        missingPeriods: [
+          `Daily candle history is limited to the most recent 365 days for the ${symbols.length} most recently active symbols.`,
+          ...(symbolLimitReached ? ['More than 20 symbols have stored activity; remaining symbols are not included in market context.'] : []),
+        ],
+      })
+    } catch (error) {
+      const message = publicError(error)
+      failures.push(`${candleEndpoint}: ${message}`)
+      saveEndpointResult({ accountId, product, endpoint: candleEndpoint, ...updateHistory(candleEndpoint, []), complete: false, missingPeriods: [message], error: message })
+    }
+
+    if (product === 'spot' || product === 'coin-m-futures' && !symbol.endsWith('_PERP')) continue
+    const fundingEndpoint = `market/funding:${symbol}`
+    try {
+      const cursor = getEndpointCursor(accountId, product, fundingEndpoint)
+      const startTime = cursor ? Math.max(fundingStart, Number(cursor) - 8 * 60 * 60 * 1000) : fundingStart
+      const response = await read<JsonRecord[]>(`${root}/fundingRate`, { symbol, startTime, limit: 1000 }, false)
+      const fundingRows = records(response.data)
+      const observations = fundingRows.flatMap(row => {
+        const fundingTime = numeric(row.fundingTime)
+        const rate = numeric(row.fundingRate)
+        if (fundingTime === null || rate === null) return []
+        const observation: MarketObservation = {
+          ...lineage(response.endpoint, response.retrievedAt),
+          id: `${symbol}:funding-rate:${fundingTime}`,
+          symbol,
+          product,
+          kind: 'funding-rate',
+          observedAt: new Date(fundingTime).toISOString(),
+          value: rate,
+          secondaryValue: numeric(row.markPrice),
+        }
+        return [storedRecord(accountId, product, 'market', observation.id, response.endpoint, observation, observation.observedAt, response.retrievedAt, syncRunId)]
+      })
+      saveRecords(observations)
+      const history = updateHistory(fundingEndpoint, observations)
+      saveMarketRaw(accountId, product, response.endpoint, symbol, startTime, response.data, response.retrievedAt, syncRunId)
+      const lastFundingTime = fundingRows.length ? numeric(fundingRows.at(-1)?.fundingTime) : null
+      saveEndpointResult({
+        accountId, product, endpoint: fundingEndpoint, cursor: lastFundingTime === null ? cursor : String(lastFundingTime),
+        ...history, complete: !symbolLimitReached,
+        missingPeriods: [
+          `Funding history is limited to the most recent 90 days for the ${symbols.length} most recently active perpetual symbols.`,
+          ...(symbolLimitReached ? ['More than 20 symbols have stored activity; remaining symbols are not included in market context.'] : []),
+        ],
+      })
+    } catch (error) {
+      const message = publicError(error)
+      failures.push(`${fundingEndpoint}: ${message}`)
+      saveEndpointResult({ accountId, product, endpoint: fundingEndpoint, ...updateHistory(fundingEndpoint, []), complete: false, missingPeriods: [message], error: message })
+    }
+  }
+}
+
+function saveMarketRaw(
+  accountId: string,
+  product: Product,
+  endpoint: string,
+  symbol: string,
+  startTime: number,
+  data: unknown,
+  retrievedAt: string,
+  syncRunId: string,
+) {
+  const raw: RawExchangeRecord = {
+    id: `${product}:${endpoint}:${symbol}:${startTime}`,
+    exchange: 'binance',
+    accountId,
+    product,
+    endpoint,
+    observedAt: retrievedAt,
+    retrievedAt,
+    sourceQuality: 'exchange-reported',
+    sourceRecordIds: [],
+    payload: { data: Array.isArray(data) ? data : [data] },
+    syncRunId,
+  }
+  saveRecords([storedRecord(accountId, product, 'raw', raw.id, endpoint, object(raw), retrievedAt, retrievedAt, syncRunId)])
 }
 
 async function discoverSymbols(

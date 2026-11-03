@@ -453,7 +453,7 @@ export function getTradingSnapshot(): TradingRepositorySnapshot {
     financialEvents: byKind('financialEvents'),
     positions: byKind('positions'),
     snapshots: byKind('snapshots'),
-    market: [],
+    market: byKind('market'),
     trades: byKind('trades'),
     coverage: listCoverage().map(row => ({
       accountId: row.accountId,
