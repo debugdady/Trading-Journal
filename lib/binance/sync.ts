@@ -8,6 +8,7 @@ import {
   getAccountCredentials,
   getEndpointCursor,
   listAccounts,
+  listCoverage,
   listRecords,
   refreshSyncLock,
   replaceCurrentRecords,
@@ -16,6 +17,7 @@ import {
   type StoredRecord,
   type SyncRun,
 } from './storage'
+import { coverageKey, reconstructFuturesTrades, type TradeReconstructionCoverage } from './completed-trades'
 import type {
   AccountSnapshot,
   Balance,
@@ -299,7 +301,8 @@ async function syncProduct(
     await safely(incomePath, async () => syncIncome(
       read, accountId, product, syncRunId, incomePath, product === 'coin-m-futures' ? 100 : 1000,
     ))
-    const incomeSymbols = listRecords(accountId)
+    const persistedProductRecords = listRecords(accountId).filter(record => record.product === product)
+    const incomeSymbols = persistedProductRecords
       .filter(record => record.product === product && record.kind === 'financialEvents')
       .map(record => text(record.payload.symbol))
       .filter((symbol): symbol is string => Boolean(symbol))
@@ -307,13 +310,62 @@ async function syncProduct(
       read,
       product,
       accountId,
-      [...accountBalances, ...positions, ...openOrders, ...incomeSymbols.map(symbol => ({ symbol }))],
+      [
+        ...accountBalances,
+        ...positions,
+        ...openOrders,
+        ...incomeSymbols.map(symbol => ({ symbol })),
+        ...persistedProductRecords
+          .filter(record => record.kind === 'executions' || record.kind === 'orders')
+          .map(record => ({ symbol: text(record.payload.symbol) }))
+          .filter((record): record is { symbol: string } => Boolean(record.symbol)),
+      ],
       failures,
     )
     await syncSymbolHistory({ read, accountId, product, syncRunId, symbols, failures })
     await syncMarketContext({ read, accountId, product, syncRunId, failures })
+    imported += rebuildFuturesTrades(accountId, product, syncRunId)
   }
   return imported
+}
+
+function rebuildFuturesTrades(accountId: string, product: Product, syncRunId: string) {
+  const root = product === 'usd-m-futures' ? '/fapi/v1' : '/dapi/v1'
+  const records = listRecords(accountId).filter(record => record.product === product)
+  const executions = records.filter(record => record.kind === 'executions').map(record => record.payload as unknown as Execution)
+  const events = records.filter(record => record.kind === 'financialEvents').map(record => record.payload as unknown as FinancialEvent)
+  const coverageRows = listCoverage(accountId).filter(record => record.product === product)
+  const incomeCoverage = coverageRows.find(record => record.endpoint === `${root}/income`)
+  const coverageBySymbol: Record<string, TradeReconstructionCoverage> = {}
+
+  for (const symbol of new Set(executions.map(execution => execution.symbol))) {
+    const executionCoverage = coverageRows.find(record => record.endpoint === `${root}/userTrades:${symbol}`)
+    coverageBySymbol[coverageKey(product, symbol)] = {
+      executionComplete: executionCoverage?.complete ?? false,
+      executionMissingPeriods: executionCoverage?.missingPeriods,
+      funding: {
+        earliest: incomeCoverage?.earliest ?? null,
+        latest: incomeCoverage?.latest ?? null,
+        complete: incomeCoverage?.complete ?? false,
+        missingPeriods: incomeCoverage?.missingPeriods ?? ['Futures income history coverage is unavailable.'],
+      },
+    }
+  }
+
+  const trades = reconstructFuturesTrades(executions, events, coverageBySymbol)
+  const stored = trades.map(trade => storedRecord(
+    accountId,
+    product,
+    'trades',
+    trade.id,
+    'reconstructed:futures-position-lifecycle',
+    object(trade),
+    trade.closedAt ?? trade.openedAt,
+    new Date().toISOString(),
+    syncRunId,
+  ))
+  replaceCurrentRecords(stored, accountId, product, 'trades')
+  return stored.length
 }
 
 async function syncMarketContext(input: {
@@ -563,23 +615,36 @@ async function syncSymbolHistory(input: {
       const endpoint = `${tradesPath}:${symbol}`
       const cursor = getEndpointCursor(accountId, product, endpoint)
       let fromId = cursor ? Math.max(0, Number(cursor) - 10) : 0
+      let lastTradeId = cursor === null ? null : Number(cursor)
       let count = 0
       let complete = true
+      let earliest: number | null = null
+      let latest: number | null = null
       const limit = product === 'coin-m-futures' ? 100 : 1000
       for (let page = 0; page < 25; page += 1) {
         const response = await read<JsonRecord[]>(tradesPath, { symbol, fromId, limit })
         const items = records(response.data)
         count += importExecutions(response, accountId, product, syncRunId)
+        const times = items.map(item => timestamp(item.time)).filter((value): value is number => value !== null)
+        if (times.length) {
+          earliest = earliest === null ? Math.min(...times) : Math.min(earliest, ...times)
+          latest = latest === null ? Math.max(...times) : Math.max(latest, ...times)
+        }
+        const pageLastId = numeric(items.at(-1)?.id)
+        if (pageLastId !== null) lastTradeId = pageLastId
         if (items.length < limit) break
-        const lastId = numeric(items.at(-1)?.id)
-        if (lastId === null || lastId < fromId) { complete = false; break }
-        fromId = lastId + 1
+        if (pageLastId === null || pageLastId < fromId) { complete = false; break }
+        fromId = pageLastId + 1
         if (page === 24) complete = false
       }
-      const lastId = fromId > 0 ? String(fromId - 1) : cursor
       saveEndpointResult({
-        accountId, product, endpoint, cursor: lastId, recordCount: count, complete,
+        accountId, product, endpoint,
+        cursor: lastTradeId === null ? cursor : String(Math.max(lastTradeId, Number(cursor ?? 0))),
+        recordCount: count,
+        complete,
         missingPeriods: complete ? [] : ['History page limit reached; remaining executions will be imported on a later sync.'],
+        earliest: earliest === null ? null : new Date(earliest).toISOString(),
+        latest: latest === null ? null : new Date(latest).toISOString(),
       })
       return count
     })
@@ -762,12 +827,18 @@ function importExecutions(response: { data: JsonRecord[]; endpoint: string; retr
       product,
       symbol,
       side: text(item.side) ?? (item.isBuyer === true || item.buyer === true ? 'BUY' : item.isBuyer === false || item.buyer === false ? 'SELL' : 'UNKNOWN'),
+      positionSide: text(item.positionSide) ?? undefined,
       price: numeric(item.price),
+      priceExact: text(item.price),
       quantity: numeric(item.qty ?? item.quantity),
+      quantityExact: text(item.qty ?? item.quantity),
       quoteQuantity: numeric(item.quoteQty),
+      quoteQuantityExact: text(item.quoteQty),
       commission: numeric(item.commission),
+      commissionExact: text(item.commission),
       commissionAsset: text(item.commissionAsset) ?? undefined,
       realizedPnl: numeric(item.realizedPnl),
+      realizedPnlExact: text(item.realizedPnl),
       isMaker: typeof item.isMaker === 'boolean' ? item.isMaker : typeof item.maker === 'boolean' ? item.maker : undefined,
       executedAt: isoTime(item.time) ?? response.retrievedAt,
     }
@@ -858,6 +929,7 @@ function importIncome(response: { data: JsonRecord[]; endpoint: string; retrieve
       type: incomeType === 'FUNDING_FEE' ? 'funding' : incomeType === 'COMMISSION' ? 'commission' : incomeType === 'REALIZED_PNL' ? 'realized-pnl' : 'other',
       asset: text(item.asset) ?? 'unknown',
       amount: numeric(item.income),
+      amountExact: text(item.income),
       symbol: text(item.symbol) ?? undefined,
       transactionId: text(item.tranId) ?? undefined,
       tradeId: text(item.tradeId) ?? undefined,

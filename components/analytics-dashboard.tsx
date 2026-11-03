@@ -1,20 +1,22 @@
 'use client'
 
 import { useMemo, useState } from 'react'
+import Decimal from 'decimal.js'
 import { Activity, Download, RotateCcw } from 'lucide-react'
 import { Area, AreaChart, Bar, BarChart, CartesianGrid, Cell, Line, LineChart, Pie, PieChart, ReferenceLine, ResponsiveContainer, Tooltip, XAxis, YAxis } from 'recharts'
 import { Button } from '@/components/ui/button'
-import type { JournalTrade } from '@/lib/trading/manual-journal'
-import type { Coverage, FinancialEvent, Product, TradingRepositorySnapshot } from '@/lib/trading/types'
+import { useJournalTrades, type JournalTrade } from '@/lib/trading/manual-journal'
+import type { CompletedTrade, Coverage, FinancialEvent, Product, TradingRepositorySnapshot } from '@/lib/trading/types'
 import { formatMoney, formatQuantity } from '@/lib/trading/format-money'
+import { completedTradeAsset, summarizeCompletedTrades } from '@/lib/trading/completed-trade-metrics'
 
-type Tab = 'Performance' | 'Trade Edge' | 'Execution & Costs' | 'Risk' | 'Market Context' | 'Portfolio' | 'Psychology'
+type Tab = 'Performance' | 'Trading Edge' | 'Execution & Costs' | 'Risk & Drawdown' | 'Market Context' | 'Portfolio Risk' | 'Trade Management'
 type Range = '7D' | '30D' | '90D' | '6M' | '1Y' | 'All Time'
 type RealizedSeries = { key: string; name: string; asset: string; color: string }
 type RealizedPoint = { date: string; label: string; daily: Record<string, number>; cumulative: Record<string, number> }
 type RealizedAssetChart = { asset: string; series: RealizedSeries[]; data: RealizedPoint[] }
 
-const tabs: Tab[] = ['Performance', 'Trade Edge', 'Execution & Costs', 'Risk', 'Market Context', 'Portfolio', 'Psychology']
+const tabs: Tab[] = ['Performance', 'Trading Edge', 'Execution & Costs', 'Risk & Drawdown', 'Market Context', 'Portfolio Risk', 'Trade Management']
 const products: { value: Product; label: string }[] = [
   { value: 'spot', label: 'Spot' },
   { value: 'usd-m-futures', label: 'USDⓈ-M Futures' },
@@ -22,10 +24,19 @@ const products: { value: Product; label: string }[] = [
 ]
 const productName = (value: string) => products.find(item => item.value === value)?.label ?? value
 const formatDate = (value: string) => new Date(value).toLocaleDateString('en-US', { month: 'short', day: 'numeric', timeZone: 'UTC' })
+const formatDuration = (milliseconds: number | null) => {
+  if (milliseconds === null || !Number.isFinite(milliseconds)) return 'Unavailable'
+  const minutes = Math.round(milliseconds / 60_000)
+  if (minutes < 60) return `${minutes}m`
+  const hours = Math.floor(minutes / 60)
+  if (hours < 48) return `${hours}h ${minutes % 60}m`
+  const days = Math.floor(hours / 24)
+  return `${days}d ${hours % 24}h`
+}
 const money = (value: number | null | undefined, asset?: string) => formatMoney(value, { asset, unavailable: 'Unavailable' })
 const csv = (value: unknown) => `"${String(value ?? '').replaceAll('"', '""')}"`
 
-export function AnalyticsDashboard({ snapshot, trades, accountIds }: { snapshot: TradingRepositorySnapshot; trades: JournalTrade[]; accountIds: string[] }) {
+export function AnalyticsDashboard({ snapshot, trades, accountIds }: { snapshot: TradingRepositorySnapshot; trades?: JournalTrade[]; accountIds: string[] }) {
   const [tab, setTab] = useState<Tab>('Performance')
   const [range, setRange] = useState<Range>('30D')
   const [product, setProduct] = useState('All')
@@ -37,6 +48,8 @@ export function AnalyticsDashboard({ snapshot, trades, accountIds }: { snapshot:
   const [marketChartSymbol, setMarketChartSymbol] = useState('')
   const [balanceSearch, setBalanceSearch] = useState('')
   const [showZeroBalances, setShowZeroBalances] = useState(false)
+  const { trades: savedTrades } = useJournalTrades()
+  const journalTrades = trades ?? savedTrades
   const enabledAccounts = useMemo(() => new Set(accountIds), [accountIds])
 
   const cutoff = useMemo(() => {
@@ -55,7 +68,7 @@ export function AnalyticsDashboard({ snapshot, trades, accountIds }: { snapshot:
     const hour = new Date(time).getUTCHours()
     return session === '00:00–08:00 UTC' ? hour < 8 : session === '08:00–16:00 UTC' ? hour >= 8 && hour < 16 : hour >= 16
   }
-  const manual = useMemo(() => trades.filter(trade => {
+  const manual = useMemo(() => journalTrades.filter(trade => {
     const market = products.find(item => item.label === product)?.value
     return matchesDate(trade.closed)
       && matchesSession(trade.closed)
@@ -63,7 +76,7 @@ export function AnalyticsDashboard({ snapshot, trades, accountIds }: { snapshot:
       && (symbol === 'All' || trade.symbol === symbol)
       && (direction === 'All' || trade.side.toLowerCase() === direction.toLowerCase())
       && (strategy === 'All' || trade.strategy === strategy)
-  }), [trades, cutoff, product, symbol, direction, strategy, session])
+  }), [journalTrades, cutoff, product, symbol, direction, strategy, session])
   const accountExecutions = useMemo(() => snapshot.executions.filter(item => enabledAccounts.has(item.accountId)), [snapshot.executions, enabledAccounts])
   const accountEvents = useMemo(() => snapshot.financialEvents.filter(item => enabledAccounts.has(item.accountId)), [snapshot.financialEvents, enabledAccounts])
   const executions = useMemo(() => accountExecutions.filter(item => matchesDate(item.executedAt)
@@ -77,25 +90,47 @@ export function AnalyticsDashboard({ snapshot, trades, accountIds }: { snapshot:
     && (product === 'All' || item.product === products.find(value => value.label === product)?.value)
     && (asset === 'All' || item.asset === asset)
     && (symbol === 'All' || item.symbol === symbol)), [accountEvents, cutoff, product, symbol, asset, session])
-  const symbols = [...new Set([...trades.map(item => item.symbol), ...accountExecutions.map(item => item.symbol), ...accountEvents.map(item => item.symbol).filter((value): value is string => Boolean(value))])].sort()
-  const strategies = [...new Set(trades.map(item => item.strategy).filter(Boolean))].sort()
+  const reconstructedTrades = useMemo(() => snapshot.trades.filter(item => enabledAccounts.has(item.accountId)
+    && matchesDate(item.closedAt ?? item.openedAt ?? '')
+    && matchesSession(item.closedAt ?? item.openedAt ?? '')
+    && (product === 'All' || item.product === products.find(value => value.label === product)?.value)
+    && (symbol === 'All' || item.symbol === symbol)
+    && (direction === 'All' || item.direction.toLowerCase() === direction.toLowerCase())
+    && (strategy === 'All' || item.strategy === strategy)
+    && (asset === 'All' || item.grossPnlAsset === asset)), [snapshot.trades, enabledAccounts, cutoff, product, symbol, direction, strategy, asset, session])
+  const completedTrades = useMemo(() => reconstructedTrades.filter(item => item.status === 'complete'), [reconstructedTrades])
+  const tradePerformance = useMemo(() => summarizeCompletedTrades(completedTrades), [completedTrades])
+  const tradeEdgeBreakdowns = useMemo(() => ({
+    direction: groupCompletedTrades(completedTrades, trade => trade.direction),
+    symbol: groupCompletedTrades(completedTrades, trade => `${productName(trade.product)} · ${trade.symbol}`),
+    weekday: groupCompletedTrades(completedTrades, trade => {
+      const time = Date.parse(trade.closedAt ?? '')
+      return Number.isFinite(time) ? new Date(time).toLocaleDateString('en-US', { weekday: 'long', timeZone: 'UTC' }) : null
+    }),
+    hour: groupCompletedTrades(completedTrades, trade => {
+      const time = Date.parse(trade.closedAt ?? '')
+      return Number.isFinite(time) ? `${String(new Date(time).getUTCHours()).padStart(2, '0')}:00 UTC` : null
+    }),
+    session: groupCompletedTrades(completedTrades, trade => {
+      const time = Date.parse(trade.closedAt ?? '')
+      if (!Number.isFinite(time)) return null
+      const hour = new Date(time).getUTCHours()
+      return hour < 8 ? '00:00–08:00 UTC' : hour < 16 ? '08:00–16:00 UTC' : '16:00–24:00 UTC'
+    }),
+    holding: groupCompletedTrades(completedTrades, trade => {
+      const opened = Date.parse(trade.openedAt ?? '')
+      const closed = Date.parse(trade.closedAt ?? '')
+      if (!Number.isFinite(opened) || !Number.isFinite(closed) || closed < opened) return null
+      const hours = (closed - opened) / 3_600_000
+      return hours < 1 ? '< 1 hour' : hours < 4 ? '1–4 hours' : hours < 24 ? '4–24 hours' : '24+ hours'
+    }),
+    strategy: groupCompletedTrades(completedTrades, trade => trade.strategy || 'No strategy recorded'),
+  }), [completedTrades])
+  const incompleteTradeCount = reconstructedTrades.filter(item => item.status !== 'complete').length
+  const symbols = [...new Set([...journalTrades.map(item => item.symbol), ...snapshot.trades.map(item => item.symbol), ...accountExecutions.map(item => item.symbol), ...accountEvents.map(item => item.symbol).filter((value): value is string => Boolean(value))])].sort()
+  const strategies = [...new Set(journalTrades.map(item => item.strategy).filter(Boolean))].sort()
   const manualStrategies = [...new Set(manual.map(item => item.strategy).filter(Boolean))].sort()
-  const assets = [...new Set([...accountEvents.map(item => item.asset), ...accountExecutions.map(item => item.commissionAsset).filter((value): value is string => Boolean(value))])].sort()
-  const manualTotal = manual.reduce((sum, trade) => sum + trade.pnl, 0)
-  const winners = manual.filter(trade => trade.pnl > 0)
-  const losers = manual.filter(trade => trade.pnl < 0)
-  const manualDaily = useMemo(() => {
-    const groups = new Map<string, number>()
-    manual.forEach(trade => {
-      const key = new Date(trade.closed).toISOString().slice(0, 10)
-      groups.set(key, (groups.get(key) ?? 0) + trade.pnl)
-    })
-    let cumulative = 0
-    return [...groups.entries()].sort(([a], [b]) => a.localeCompare(b)).map(([date, daily]) => {
-      cumulative += daily
-      return { date, label: formatDate(date), daily, cumulative }
-    })
-  }, [manual])
+  const assets = [...new Set([...accountEvents.map(item => item.asset), ...accountExecutions.map(item => item.commissionAsset).filter((value): value is string => Boolean(value)), ...snapshot.trades.map(item => item.grossPnlAsset).filter((value): value is string => Boolean(value))])].sort()
   const realized = events.filter(event => event.type === 'realized-pnl' && event.amount !== null)
   const realizedCharts = useMemo(() => buildRealizedCharts(realized), [realized])
   const realizedDrawdownCharts = useMemo(() => buildRealizedDrawdown(realizedCharts), [realizedCharts])
@@ -130,6 +165,7 @@ export function AnalyticsDashboard({ snapshot, trades, accountIds }: { snapshot:
     && hasSnapshotValues(item))
   const accountCoverage = snapshot.coverage.filter(item => enabledAccounts.has(item.accountId)
     && (product === 'All' || item.product === selectedProduct))
+  const lifecycleCoverage = accountCoverage.filter(item => item.endpoint.includes('/userTrades:') || item.endpoint.endsWith('/income'))
   const accountBalances = snapshot.balances.filter(item => enabledAccounts.has(item.accountId)
     && (product === 'All' || item.product === products.find(value => value.label === product)?.value))
   const zeroBalanceCount = accountBalances.filter(isZeroBalance).length
@@ -260,6 +296,58 @@ export function AnalyticsDashboard({ snapshot, trades, accountIds }: { snapshot:
     <div className="flex gap-1 overflow-x-auto border-b border-border pb-px" role="tablist" aria-label="Analytics views">{tabs.map(item => <button key={item} role="tab" aria-selected={tab === item} onClick={() => setTab(item)} className={`whitespace-nowrap border-b-2 px-3 py-2.5 text-xs ${tab === item ? 'border-foreground font-medium text-foreground' : 'border-transparent text-muted-foreground hover:text-foreground'}`}>{item}</button>)}</div>
 
     {tab === 'Performance' && <div className="flex flex-col gap-5">
+      <div>
+        <div className="mb-3"><h2 className="text-sm font-medium">Completed-trade performance</h2><p className="mt-1 text-[11px] text-muted-foreground">Reconstructed futures position lifecycles; exchange income events below remain a separate report.</p></div>
+        {incompleteTradeCount > 0 && <p role="status" className="mb-3 rounded-md border border-amber-500/30 bg-amber-500/5 px-3 py-2 text-[11px] text-amber-700 dark:text-amber-300">{incompleteTradeCount} open or incomplete lifecycle record(s) match these filters. They are excluded from completed-trade performance.</p>}
+        {lifecycleCoverage.length === 0
+          ? <p role="status" className="mb-3 rounded-md border border-amber-500/30 bg-amber-500/5 px-3 py-2 text-[11px] text-amber-700 dark:text-amber-300">Futures execution and income-history coverage is unavailable for this selection. Trade completeness and cost attribution cannot be confirmed.</p>
+          : lifecycleCoverage.some(item => !item.complete) && <div role="status" className="mb-3 rounded-md border border-amber-500/30 bg-amber-500/5 px-3 py-2 text-[11px] text-amber-700 dark:text-amber-300"><p>Futures history coverage is partial; available results may not include all prior executions or costs.</p><ul className="mt-1 list-inside list-disc">{lifecycleCoverage.filter(item => !item.complete).slice(0, 4).map(item => <li key={`${item.accountId}:${item.endpoint}`}>{item.endpoint}: {item.missingPeriods.join(' ') || 'Coverage is incomplete.'}</li>)}</ul></div>}
+        {tradePerformance.length ? <div className="space-y-5">{tradePerformance.map(summary => {
+          const daily = summary.dailyGross.map(item => {
+            return { ...item, label: formatDate(item.date), amountNumber: new Decimal(item.amount).toNumber() }
+          })
+          const knownFees = summary.trades.every(item => item.feesExact !== null && item.feesExact !== undefined)
+          const totalFees = knownFees ? summary.trades.reduce((total, item) => total.plus(item.feesExact!), new Decimal(0)) : null
+          const grossAbsolute = summary.gross === null ? null : new Decimal(summary.gross).abs()
+          const feePercentOfGross = totalFees && grossAbsolute && !grossAbsolute.isZero()
+            ? totalFees.dividedBy(grossAbsolute).times(100).toNumber()
+            : null
+          return <Panel key={summary.asset} title={`Completed-trade performance · ${summary.asset}`} subtitle={`${summary.total} completed lifecycles · ${summary.analyzable} with fully attributable net P&L · average R-multiple unavailable because initial risk is not recorded.`}>
+            <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-4">
+              <Metric label="Completed trades" value={summary.total.toLocaleString()} detail="Reconstructed closed positions" />
+              <Metric label="Wins / losses / flat" value={`${summary.wins} / ${summary.losses} / ${summary.breakeven}`} detail={`${summary.analyzable} outcomes with net P&L`} />
+              <Metric label="Win rate" value={summary.winRate === null ? 'Insufficient data' : `${summary.winRate.toFixed(1)}%`} detail="Net completed-trade outcomes" />
+              <Metric label="Average holding time" value={formatDuration(summary.averageHoldingMs)} detail="Open to fully closed lifecycle" />
+              <Metric label="Gross realized P&L" value={summary.gross === null ? 'Unavailable' : money(Number(summary.gross), summary.asset)} detail="Execution-reported realized P&L" tone={summary.gross === null ? 'neutral' : Number(summary.gross) > 0 ? 'positive' : Number(summary.gross) < 0 ? 'negative' : 'neutral'} />
+              <Metric label="Net realized P&L" value={summary.net === null ? 'Unavailable' : money(Number(summary.net), summary.asset)} detail={`${summary.total - summary.analyzable} trade(s) lack full cost attribution`} tone={summary.net === null ? 'neutral' : Number(summary.net) > 0 ? 'positive' : Number(summary.net) < 0 ? 'negative' : 'neutral'} />
+              <Metric label="Average winner / loser" value={summary.averageWin === null || summary.averageLoss === null ? 'Insufficient data' : `${money(Number(summary.averageWin), summary.asset)} / ${money(Number(summary.averageLoss), summary.asset)}`} detail="Net result per winning / losing trade" />
+              <Metric label="Largest winner / loser" value={summary.largestWinner === null || summary.largestLoser === null ? 'Insufficient data' : `${money(Number(summary.largestWinner), summary.asset)} / ${money(Number(summary.largestLoser), summary.asset)}`} detail="Net result" />
+              <Metric label="Profit factor" value={summary.profitFactor === null ? 'Insufficient data' : summary.profitFactor.toFixed(2)} detail="Gross winning / losing net P&L" />
+              <Metric label="Trade expectancy" value={summary.expectancy === null ? 'Insufficient data' : money(Number(summary.expectancy), summary.asset)} detail="Average net P&L per analyzable trade" />
+              <Metric label="Average R-multiple" value="Unavailable" detail="Initial risk is not recorded" />
+              <Metric label="Commissions / gross P&L" value={feePercentOfGross === null ? 'Unavailable' : `${feePercentOfGross.toFixed(2)}%`} detail="Only when all fees and gross P&L are known" />
+            </div>
+            <div className="mt-5 grid gap-5 xl:grid-cols-2">
+              <div className="rounded-md border border-border/70 p-3">
+                <h3 className="text-xs font-medium">Daily completed-trade gross P&amp;L</h3>
+                <p className="mt-1 text-[10px] text-muted-foreground">Grouped by UTC close date. Currency stays in {summary.asset}.</p>
+                {daily.length ? <div className="mt-2"><Chart><BarChart data={daily}><CartesianGrid stroke="var(--border)" vertical={false} /><XAxis dataKey="label" interval="preserveStartEnd" tick={{ fill: 'var(--muted-foreground)', fontSize: 10 }} /><YAxis width={72} tickFormatter={value => money(Number(value), summary.asset)} tick={{ fill: 'var(--muted-foreground)', fontSize: 10 }} /><ReferenceLine y={0} stroke="var(--muted-foreground)" strokeDasharray="3 3" /><Tooltip content={<Tip moneyValues asset={summary.asset} />} /><Bar dataKey="amountNumber" name="Gross trade P&L" radius={[2, 2, 0, 0]}>{daily.map(item => <Cell key={item.date} fill={item.amountNumber >= 0 ? 'var(--positive)' : 'var(--negative)'} />)}</Bar></BarChart></Chart></div> : <Empty text="No dated completed trades are available." />}
+              </div>
+              <div className="rounded-md border border-border/70 p-3">
+                <h3 className="text-xs font-medium">Monthly completed-trade gross P&amp;L</h3>
+                <p className="mt-1 text-[10px] text-muted-foreground">Reconstructed trades only; not exchange income-event totals.</p>
+                {summary.monthlyGross.length ? <div className="mt-3 max-h-[220px] overflow-auto"><table className="w-full text-left text-xs"><thead className="sticky top-0 border-b border-border bg-card text-[10px] uppercase text-muted-foreground"><tr><th className="py-2">Month (UTC)</th><th className="py-2 text-right">Gross P&amp;L</th></tr></thead><tbody className="divide-y divide-border">{summary.monthlyGross.map(item => <tr key={item.month}><td className="py-2">{item.month}</td><td className={`py-2 text-right font-mono tabular-nums ${Number(item.amount) > 0 ? 'text-emerald-500' : Number(item.amount) < 0 ? 'text-rose-500' : ''}`}>{money(Number(item.amount), summary.asset)}</td></tr>)}</tbody></table></div> : <Empty text="No monthly completed-trade results are available." />}
+              </div>
+            </div>
+          </Panel>
+        })}</div> : <Empty text="No completed futures trades match these filters. Sync execution history; incomplete lifecycles are not treated as completed trades." />}
+      </div>
+      <Panel title="Recorded account equity" subtitle="Persisted Binance snapshots by account, product, and currency. Separate series are never combined; this is not reconstructed from trade P&L.">
+        {portfolioSnapshotGroups.length ? <div className="space-y-5">{portfolioSnapshotGroups.map(group => <div key={group.key} className="min-w-0">
+          <div className="mb-2 flex items-center justify-between gap-3"><p className="truncate text-[10px] font-medium text-muted-foreground">{group.label}</p><p className="shrink-0 text-[10px] text-muted-foreground">{group.data.length} snapshots</p></div>
+          <Chart><LineChart data={group.data}><CartesianGrid stroke="var(--border)" vertical={false} /><XAxis dataKey="label" interval="preserveStartEnd" tick={{ fill: 'var(--muted-foreground)', fontSize: 10 }} /><YAxis width={84} tickFormatter={value => money(Number(value), group.currency)} tick={{ fill: 'var(--muted-foreground)', fontSize: 10 }} /><Tooltip content={<Tip moneyValues asset={group.currency} />} /><Line dataKey="equity" name="Reported equity" stroke="var(--chart-3)" dot={false} activeDot={{ r: 4 }} /></LineChart></Chart>
+        </div>)}</div> : <Empty text="No recorded equity history matches this filter. Sharpe, Sortino, and account-equity returns are unavailable without a usable snapshot series." />}
+      </Panel>
       <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-5">
         <Metric label="Exchange realized P&L" value={realizedSummary.value} detail={realizedSummary.detail} tone={realizedSummary.tone} />
         <Metric label="Positive / negative events" value={realized.length ? `${positiveRealizedEvents} / ${negativeRealizedEvents}` : 'Unavailable'} detail={realized.length ? `${realized.length} reported events · not a trade win rate` : 'No realized P&L events in this selection'} />
@@ -285,20 +373,20 @@ export function AnalyticsDashboard({ snapshot, trades, accountIds }: { snapshot:
         </Panel>
       </div>
       <div className="grid gap-5 xl:grid-cols-[1.4fr_1fr]">
-        <Panel title={realizedCharts.length ? 'Cumulative exchange realized P&L' : 'Cumulative reported journal P&L'} subtitle={realizedCharts.length ? 'Exchange events by product and asset. Different assets are charted separately.' : 'User-entered values by close date.'}>
+        <Panel title="Cumulative exchange realized P&L" subtitle="Exchange events by product and asset. Different assets are charted separately from completed trades above.">
           {realizedCharts.length
             ? <div className="space-y-6">{realizedCharts.map(chart => <div key={chart.asset} className="min-w-0"><div className="mb-2 flex items-center justify-between gap-3"><p className="text-[10px] font-medium text-muted-foreground">{chart.asset}</p><p className="text-[10px] text-muted-foreground">Line color reflects latest net</p></div><Chart><AreaChart data={chart.data} margin={{ top: 8, right: 8, bottom: 4, left: 4 }}><CartesianGrid stroke="var(--border)" vertical={false} /><XAxis dataKey="label" interval="preserveStartEnd" tickMargin={8} tick={{ fill: 'var(--muted-foreground)', fontSize: 10 }} /><YAxis width={64} tickFormatter={value => formatMoney(Number(value), { signed: true })} tick={{ fill: 'var(--muted-foreground)', fontSize: 10 }} /><ReferenceLine y={0} stroke="var(--muted-foreground)" strokeDasharray="3 3" /><Tooltip content={<RealizedTip asset={chart.asset} />} />{chart.series.map(item => { const latest = chart.data.at(-1)?.cumulative[item.key] ?? 0; const color = latest >= 0 ? 'var(--positive)' : 'var(--negative)'; return <Area key={item.key} type="monotone" dataKey={(point: RealizedPoint) => point.cumulative[item.key] ?? 0} name={item.name} stroke={color} fill={color} fillOpacity={0.08} strokeWidth={2} dot={false} activeDot={{ r: 4 }} /> })}</AreaChart></Chart></div>)}</div>
-            : manualDaily.length ? <Chart><AreaChart data={manualDaily}><CartesianGrid stroke="var(--border)" vertical={false} /><XAxis dataKey="label" tick={{ fontSize: 10 }} /><YAxis tickFormatter={value => formatMoney(Number(value))} tick={{ fontSize: 10 }} /><Tooltip content={<Tip moneyValues />} /><Area dataKey="cumulative" name="Reported P&L" stroke="var(--foreground)" fill="var(--muted)" /></AreaChart></Chart> : <Empty text="No exchange realized P&L or dated manual journal entries match these filters." />}
+            : <Empty text="No exchange realized P&L events match these filters." />}
         </Panel>
         <Panel title="Realized P&L by product and asset" subtitle="Exchange-reported Binance income events.">
           {realizedByAsset.length ? <AmountTable rows={realizedByAsset} /> : <Empty text="No realized P&L events are stored for this selection." />}
         </Panel>
       </div>
       <div className="grid gap-5 xl:grid-cols-2">
-        <Panel title={realizedCharts.length ? 'Daily exchange realized P&L' : 'Daily reported journal P&L'} subtitle={realizedCharts.length ? 'Green bars are positive; red bars are negative. Assets remain separate.' : 'Manual journal entries only.'}>
+        <Panel title="Daily exchange realized P&L" subtitle="Green bars are positive; red bars are negative. Assets remain separate from completed-trade results.">
           {realizedCharts.length
             ? <div className="space-y-6">{realizedCharts.map(chart => <div key={chart.asset} className="min-w-0"><p className="mb-2 text-[10px] font-medium text-muted-foreground">{chart.asset}</p><Chart><BarChart data={chart.data} margin={{ top: 8, right: 8, bottom: 4, left: 4 }}><CartesianGrid stroke="var(--border)" vertical={false} /><XAxis dataKey="label" interval="preserveStartEnd" tickMargin={8} tick={{ fill: 'var(--muted-foreground)', fontSize: 10 }} /><YAxis width={64} tickFormatter={value => formatMoney(Number(value), { signed: true })} tick={{ fill: 'var(--muted-foreground)', fontSize: 10 }} /><ReferenceLine y={0} stroke="var(--muted-foreground)" strokeDasharray="3 3" /><Tooltip content={<RealizedTip asset={chart.asset} daily />} />{chart.series.map(item => <Bar key={item.key} dataKey={(point: RealizedPoint) => point.daily[item.key] ?? 0} name={item.name} radius={[2, 2, 0, 0]}>{chart.data.map(point => <Cell key={`${item.key}:${point.date}`} fill={(point.daily[item.key] ?? 0) >= 0 ? 'var(--positive)' : 'var(--negative)'} />)}</Bar>)}</BarChart></Chart></div>)}</div>
-            : manualDaily.length ? <Chart><BarChart data={manualDaily}><CartesianGrid stroke="var(--border)" vertical={false} /><XAxis dataKey="label" tick={{ fontSize: 10 }} /><YAxis tickFormatter={value => formatMoney(Number(value))} tick={{ fontSize: 10 }} /><Tooltip content={<Tip moneyValues />} /><Bar dataKey="daily" name="Reported P&L" fill="var(--chart-3)" /></BarChart></Chart> : <Empty text="No exchange realized P&L or dated manual journal entries match these filters." />}
+            : <Empty text="No daily exchange realized P&L events are available." />}
         </Panel>
         <Panel title="Recorded commissions" subtitle="Exchange income events, grouped by product and asset without currency conversion.">
           {commissionsByAsset.length ? <AmountTable rows={commissionsByAsset} /> : <Empty text="No commission financial events are stored. Execution fees are shown in Execution & Costs." />}
@@ -314,7 +402,7 @@ export function AnalyticsDashboard({ snapshot, trades, accountIds }: { snapshot:
       </div>
     </div>}
 
-    {tab === 'Trade Edge' && <div className="grid gap-5 xl:grid-cols-2">
+    {tab === 'Trading Edge' && <div className="grid gap-5 xl:grid-cols-2">
       <Panel title="Exchange realized P&L by symbol" subtitle="Persisted Binance realized-P&L events grouped by product, asset, and reported symbol.">
         {realizedBySymbol.length ? <div className="overflow-x-auto"><table className="w-full min-w-[560px] text-left text-xs"><thead className="sticky top-0 border-b border-border bg-card text-[10px] uppercase tracking-wide text-muted-foreground"><tr><th className="py-2.5 pr-3">Symbol</th><th className="py-2.5 pr-3">Product · asset</th><th className="py-2.5 pr-3 text-right">Events</th><th className="py-2.5 text-right">Realized P&L</th></tr></thead><tbody className="divide-y divide-border">{realizedBySymbol.map(item => <tr key={item.key} className="transition-colors hover:bg-muted/30"><td className="py-3 pr-3 font-mono font-medium">{item.symbol ?? 'No symbol reported'}</td><td className="py-3 pr-3 text-muted-foreground">{productName(item.product)} · {item.asset}</td><td className="py-3 pr-3 text-right tabular-nums">{item.count}</td><td className={`py-3 text-right font-mono tabular-nums ${item.amount > 0 ? 'text-emerald-500' : item.amount < 0 ? 'text-rose-500' : 'text-muted-foreground'}`}>{money(item.amount, item.asset)}</td></tr>)}</tbody></table></div> : <Empty text="No exchange realized-P&L events match these filters." />}
         {manualStrategies.length === 0 && <p className="mt-3 border-t border-border pt-3 text-[10px] text-muted-foreground">Manual strategy results are unavailable until a strategy is recorded on a journal entry.</p>}
@@ -323,7 +411,7 @@ export function AnalyticsDashboard({ snapshot, trades, accountIds }: { snapshot:
         {executions.length ? <div className="overflow-x-auto"><table className="w-full min-w-[520px] text-left text-xs"><thead className="sticky top-0 border-b border-border bg-card text-[10px] uppercase tracking-wide text-muted-foreground"><tr><th className="py-2.5 pr-3">Symbol</th><th className="py-2.5 pr-3">Product</th><th className="py-2.5 pr-3 text-right">Fills</th><th className="py-2.5 text-right">Executed quantity</th></tr></thead><tbody className="divide-y divide-border">{groupExecutions(executions).map(item => <tr key={item.key} className="transition-colors hover:bg-muted/30"><td className="py-3 pr-3 font-mono font-medium">{item.symbol}</td><td className="py-3 pr-3 text-muted-foreground">{productName(item.product)}</td><td className="py-3 pr-3 text-right tabular-nums">{item.count.toLocaleString()}</td><td className="py-3 text-right font-mono tabular-nums">{item.quantity === null ? 'Unavailable' : item.quantity.toLocaleString(undefined, { maximumFractionDigits: 8 })}</td></tr>)}</tbody></table></div> : <Empty text="No synced executions match these filters." />}
       </Panel>
     </div>}
-    {tab === 'Trade Edge' && <div className="grid gap-5 xl:grid-cols-3">
+    {tab === 'Trading Edge' && <div className="grid gap-5 xl:grid-cols-3">
       <Panel title="Fill activity by side" subtitle="Actual fill counts and executed quantities from Binance.">
         {executionSides.length ? <div className="space-y-2">{executionSides.map(item => <div key={item.label} className="flex items-center justify-between gap-3 rounded-md border border-border/70 bg-muted/20 px-3 py-3 text-xs"><span className="font-medium">{item.label}</span><span className="font-mono text-right tabular-nums">{item.count} fills<span className="block text-[10px] text-muted-foreground">{item.quantity === null ? 'quantity unavailable' : `qty ${formatQuantity(item.quantity)}`}</span></span></div>)}</div> : <Empty text="No Binance executions match these filters." />}
       </Panel>
@@ -334,12 +422,16 @@ export function AnalyticsDashboard({ snapshot, trades, accountIds }: { snapshot:
         {manualStrategies.length ? <div className="overflow-x-auto"><table className="w-full min-w-[420px] text-left text-xs"><thead className="border-b border-border text-[10px] uppercase tracking-wide text-muted-foreground"><tr><th className="py-2.5 pr-3">Strategy</th><th className="py-2.5 pr-3 text-right">Entries</th><th className="py-2.5 pr-3 text-right">Reported P&L</th><th className="py-2.5 text-right">Win rate</th></tr></thead><tbody className="divide-y divide-border">{manualStrategies.map(name => { const rows = manual.filter(item => item.strategy === name); const pnl = rows.reduce((sum, item) => sum + item.pnl, 0); return <tr key={name} className="transition-colors hover:bg-muted/30"><td className="py-3 pr-3 font-medium">{name}</td><td className="py-3 pr-3 text-right tabular-nums">{rows.length}</td><td className={`py-3 pr-3 text-right font-mono tabular-nums ${pnl > 0 ? 'text-emerald-500' : pnl < 0 ? 'text-rose-500' : ''}`}>{money(pnl)}</td><td className="py-3 text-right tabular-nums">{(rows.filter(item => item.pnl > 0).length / rows.length * 100).toFixed(1)}%</td></tr> })}</tbody></table></div> : <Empty text="Add a strategy to a manual journal entry to compare it here. No exchange strategy is inferred." />}
       </Panel>
     </div>}
-    {tab === 'Trade Edge' && <div className="grid gap-5 xl:grid-cols-2">
-      <Panel title="UTC hourly event activity" subtitle="Counts of exchange-reported realized P&L events by UTC hour, not a strategy-performance signal.">
+    {tab === 'Trading Edge' && <div className="grid gap-5 xl:grid-cols-2">
+      <TradeBreakdownPanel title="Long vs Short" rows={tradeEdgeBreakdowns.direction} />
+      <TradeBreakdownPanel title="Performance by symbol / product" rows={tradeEdgeBreakdowns.symbol} />
+      <TradeBreakdownPanel title="Performance by UTC weekday" rows={tradeEdgeBreakdowns.weekday} />
+      <TradeBreakdownPanel title="Performance by UTC hour" rows={tradeEdgeBreakdowns.hour} />
+      <TradeBreakdownPanel title="Performance by UTC session" rows={tradeEdgeBreakdowns.session} />
+      <TradeBreakdownPanel title="Performance by holding duration" rows={tradeEdgeBreakdowns.holding} />
+      <TradeBreakdownPanel title="Performance by strategy" rows={tradeEdgeBreakdowns.strategy} />
+      <Panel title="Exchange-event activity by UTC hour" subtitle="A separate event report; an income event is not a completed trade.">
         {realizedByHour.length ? <Chart><BarChart data={realizedByHour}><CartesianGrid stroke="var(--border)" vertical={false} /><XAxis dataKey="label" interval="preserveStartEnd" tick={{ fill: 'var(--muted-foreground)', fontSize: 10 }} /><YAxis allowDecimals={false} tick={{ fill: 'var(--muted-foreground)', fontSize: 10 }} /><Tooltip content={<Tip />} /><Bar dataKey="count" name="Realized P&L events" fill="var(--chart-3)" radius={[3, 3, 0, 0]} /></BarChart></Chart> : <Empty text="No realized P&L event timestamps are available." />}
-      </Panel>
-      <Panel title="Trade expectancy versus holding duration" subtitle="Requires complete round-trip trades and comparable P&L units.">
-        <Empty text="Unavailable — fills and income events are not reconstructed into completed trades for analytics." />
       </Panel>
     </div>}
 
@@ -372,12 +464,26 @@ export function AnalyticsDashboard({ snapshot, trades, accountIds }: { snapshot:
       </div>
     </div>}
 
-    {tab === 'Risk' && <div className="flex flex-col gap-5">
+    {tab === 'Risk & Drawdown' && <div className="flex flex-col gap-5">
       <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-4">
         <Metric label="Current non-zero positions" value={positionRiskNotApplicable ? '—' : unknownSizePositions ? `${knownOpenPositionCount} + ${unknownSizePositions} unknown` : String(knownOpenPositionCount)} detail={positionRiskNotApplicable ? 'Spot is tracked through asset balances' : positionRiskFlat ? 'Binance confirms no open positions' : positionRiskCoverageComplete ? 'Current Binance position-risk records' : 'Position-risk coverage incomplete'} />
         <Metric label="Reported open notional" value={openNotionalValue} detail={openNotionalDetail} />
         <Metric label="Positions with liquidation price" value={positionRiskNotApplicable || !positionRiskCoverageComplete && filteredPositions.length === 0 ? 'Unavailable' : String(liquidationDistances.length)} detail={positionRiskFlat ? 'No open positions reported by Binance' : positionRiskNotApplicable ? 'Not applicable to Spot balances' : 'Requires reported mark and liquidation prices'} />
         <Metric label="Maximum reported leverage" value={filteredPositions.some(item => item.leverage !== null) ? `${Math.max(...filteredPositions.map(item => item.leverage ?? 0))}×` : positionRiskFlat || positionRiskNotApplicable ? '—' : 'Unavailable'} detail={positionRiskFlat ? 'No open positions reported by Binance' : positionRiskNotApplicable ? 'Not applicable to Spot balances' : 'Current persisted positions only'} />
+      </div>
+      <div className="grid gap-5 xl:grid-cols-2">
+        {tradePerformance.length ? tradePerformance.map(summary => <Panel key={summary.asset} title={`Completed-trade drawdown · ${summary.asset}`} subtitle="Trade-sequence P&L drawdown from a zero starting baseline; not account-equity drawdown.">
+          <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-3">
+            <Metric label="Maximum drawdown" value={summary.maxDrawdown === null ? 'Insufficient data' : money(Number(summary.maxDrawdown), summary.asset)} detail="Based on net closed-trade sequence" />
+            <Metric label="Current drawdown" value={summary.currentDrawdown === null ? 'Insufficient data' : money(Number(summary.currentDrawdown), summary.asset)} detail="From the running high-water mark" />
+            <Metric label="Current drawdown duration" value={summary.drawdownDurationMs === null ? 'Insufficient data' : formatDuration(summary.drawdownDurationMs)} detail="Since last sequence high" />
+            <Metric label="Recovery time" value={summary.recoveryTimeMs === null ? 'Unavailable' : formatDuration(summary.recoveryTimeMs)} detail="Historical max drawdown recovery" />
+            <Metric label="Winning / losing streak" value={summary.longestWinStreak === null || summary.longestLossStreak === null ? 'Insufficient data' : `${summary.longestWinStreak} / ${summary.longestLossStreak}`} detail="Unavailable if any closed outcome lacks net P&L" />
+            <Metric label="Recovery factor" value={summary.recoveryFactor === null ? 'Insufficient data' : summary.recoveryFactor.toFixed(2)} detail="Net result / maximum sequence drawdown" />
+            <Metric label="Sharpe ratio" value="Unavailable" detail="No daily account-equity return series" />
+            <Metric label="Sortino ratio" value="Unavailable" detail="No daily account-equity return series" />
+          </div>
+        </Panel>) : <Panel title="Completed-trade risk metrics" subtitle="Metrics require closed lifecycles with fully attributable net P&L."><Empty text="Insufficient data for completed-trade drawdown metrics." /></Panel>}
       </div>
       <div className="grid gap-5 xl:grid-cols-2">
         <Panel title="Realized P&L drawdown" subtitle="Pullback from the high-water mark within the selected range. Exchange events only; this is not account-equity drawdown.">
@@ -478,7 +584,7 @@ export function AnalyticsDashboard({ snapshot, trades, accountIds }: { snapshot:
       </div>
     </div>}
 
-    {tab === 'Portfolio' && <div className="flex flex-col gap-5">
+    {tab === 'Portfolio Risk' && <div className="flex flex-col gap-5">
       <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-4">
         <Metric label="Latest reported equity" value={latestEquitySummary} detail={latestEquitySnapshots.length === 1 ? `${productName(latestEquitySnapshots[0].product)} · Binance snapshot` : `${latestEquitySnapshots.length} account/product snapshots · not combined`} />
         <Metric label="Non-zero balance rows" value={String(nonZeroBalanceCount)} detail={`${zeroBalanceCount.toLocaleString()} confirmed zero balances hidden`} />
@@ -564,7 +670,31 @@ export function AnalyticsDashboard({ snapshot, trades, accountIds }: { snapshot:
       </div> : <Empty text="No account snapshots match this selection." />}</Panel>
     </div>}
 
-    {tab === 'Psychology' && <div className="flex flex-col gap-5">
+    {tab === 'Trade Management' && <div className="flex flex-col gap-5">
+      <Panel title="Completed-trade management" subtitle="Only reconstructed, fully closed futures lifecycles. Open and incomplete positions are excluded.">
+        {completedTrades.length ? <div className="overflow-x-auto rounded-md border border-border">
+          <table className="w-full min-w-[980px] text-left text-xs">
+            <thead className="sticky top-0 border-b border-border bg-muted/70 text-[10px] uppercase tracking-wide text-muted-foreground"><tr>{['Closed (UTC)', 'Symbol · product', 'Direction', 'Quantity', 'Holding time', 'Partial exits', 'Gross P&L', 'Net P&L'].map(label => <th key={label} className="px-3 py-2.5 font-medium">{label}</th>)}</tr></thead>
+            <tbody className="divide-y divide-border">{[...completedTrades].sort((a, b) => (b.closedAt ?? '').localeCompare(a.closedAt ?? '')).slice(0, 100).map(item => {
+              const asset = item.grossPnlAsset
+              const opened = Date.parse(item.openedAt ?? '')
+              const closed = Date.parse(item.closedAt ?? '')
+              const duration = Number.isFinite(opened) && Number.isFinite(closed) && closed >= opened ? closed - opened : null
+              return <tr key={item.id} className="transition-colors hover:bg-muted/30">
+                <td className="whitespace-nowrap px-3 py-2.5 text-muted-foreground">{item.closedAt ? new Date(item.closedAt).toLocaleString('en-US', { timeZone: 'UTC' }) : 'Unavailable'}</td>
+                <td className="px-3 py-2.5"><span className="font-mono font-medium">{item.symbol}</span><span className="ml-2 text-[10px] text-muted-foreground">{productName(item.product)}</span></td>
+                <td className="px-3 py-2.5">{item.direction}</td>
+                <td className="px-3 py-2.5 text-right font-mono tabular-nums">{item.quantity === null ? 'Unavailable' : formatQuantity(item.quantity)}</td>
+                <td className="px-3 py-2.5 text-right">{formatDuration(duration)}</td>
+                <td className="px-3 py-2.5 text-right tabular-nums">{item.partialExitCount ?? 'Unavailable'}</td>
+                <td className="px-3 py-2.5 text-right font-mono tabular-nums">{money(item.grossPnlExact === null || item.grossPnlExact === undefined ? item.grossPnl : Number(item.grossPnlExact), asset)}</td>
+                <td className="px-3 py-2.5 text-right font-mono tabular-nums">{money(item.netPnlExact === null || item.netPnlExact === undefined ? item.netPnl : Number(item.netPnlExact), asset)}</td>
+              </tr>
+            })}</tbody>
+          </table>
+        </div> : <Empty text="No completed trades match these filters." />}
+        <p className="mt-3 text-[10px] text-muted-foreground">MAE, MFE, exit efficiency, and initial-risk R-multiples are unavailable without reliable historical market prices or recorded initial risk. No values are inferred.</p>
+      </Panel>
       <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-4">
         <Metric label="Binance executions" value={executions.length.toLocaleString()} detail="Real fills in the selected range" />
         <Metric label="Realized P&L" value={realizedSummary.value} detail={realizedSummary.detail} tone={realizedSummary.tone} />
@@ -727,6 +857,22 @@ function groupExecutions(rows: TradingRepositorySnapshot['executions']) {
     grouped.set(key, current)
   })
   return [...grouped.values()].sort((a, b) => b.count - a.count)
+}
+
+function groupCompletedTrades(trades: CompletedTrade[], getLabel: (trade: CompletedTrade) => string | null) {
+  const grouped = new Map<string, { label: string; trades: CompletedTrade[] }>()
+  for (const trade of trades) {
+    const label = getLabel(trade)
+    if (!label) continue
+    const key = `${completedTradeAsset(trade)}:${label}`
+    const group = grouped.get(key) ?? { label, trades: [] }
+    group.trades.push(trade)
+    grouped.set(key, group)
+  }
+  return [...grouped.values()].flatMap(group => {
+    const summary = summarizeCompletedTrades(group.trades)[0]
+    return summary ? [{ ...summary, label: group.label }] : []
+  }).sort((a, b) => b.total - a.total || a.label.localeCompare(b.label) || a.asset.localeCompare(b.asset))
 }
 
 function groupRealizedBySymbol(events: FinancialEvent[]) {
@@ -1071,6 +1217,27 @@ function Panel({ title, subtitle, children }: { title: string; subtitle: string;
 
 function Empty({ text }: { text: string }) {
   return <div className="grid min-h-28 place-items-center rounded-md border border-dashed border-border bg-muted/10 px-4 text-center text-xs text-muted-foreground"><span className="flex flex-col items-center gap-2"><Activity aria-hidden="true" className="size-4 opacity-60" /><span>{text}</span></span></div>
+}
+
+type TradeBreakdownRow = ReturnType<typeof summarizeCompletedTrades>[number] & { label: string }
+
+function TradeBreakdownPanel({ title, rows }: { title: string; rows: TradeBreakdownRow[] }) {
+  return <Panel title={title} subtitle="Completed trades only; rows remain separated by P&L settlement asset.">
+    {rows.length ? <div className="max-h-[360px] overflow-auto rounded-md border border-border">
+      <table className="w-full min-w-[700px] text-left text-xs">
+        <thead className="sticky top-0 border-b border-border bg-muted/70 text-[10px] uppercase tracking-wide text-muted-foreground"><tr>{['Group', 'Asset', 'Trades', 'Win rate', 'Profit factor', 'Expectancy', 'Net P&L'].map(label => <th key={label} className="px-3 py-2.5 font-medium">{label}</th>)}</tr></thead>
+        <tbody className="divide-y divide-border">{rows.slice(0, 40).map(row => <tr key={`${row.label}:${row.asset}`} className="transition-colors hover:bg-muted/30">
+          <td className="px-3 py-2.5 font-medium">{row.label}</td>
+          <td className="px-3 py-2.5 text-muted-foreground">{row.asset}</td>
+          <td className="px-3 py-2.5 text-right tabular-nums">{row.total}</td>
+          <td className="px-3 py-2.5 text-right tabular-nums">{row.winRate === null ? 'Insufficient data' : `${row.winRate.toFixed(1)}%`}</td>
+          <td className="px-3 py-2.5 text-right font-mono tabular-nums">{row.profitFactor === null ? 'Insufficient data' : row.profitFactor.toFixed(2)}</td>
+          <td className="px-3 py-2.5 text-right font-mono tabular-nums">{row.expectancy === null ? 'Unavailable' : money(Number(row.expectancy), row.asset)}</td>
+          <td className="px-3 py-2.5 text-right font-mono tabular-nums">{row.net === null ? 'Unavailable' : money(Number(row.net), row.asset)}</td>
+        </tr>)}</tbody>
+      </table>
+    </div> : <Empty text="No completed trades match this group and filter selection." />}
+  </Panel>
 }
 
 function Chart({ children }: { children: React.ReactNode }) {
