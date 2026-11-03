@@ -1,0 +1,33 @@
+# Binance endpoint-to-field matrix
+
+This matrix is the source contract for ingestion. Each response is retained as JSON in `exchange_records` with kind `raw`; normalized records are stored separately and never replace raw data. Unknown response fields remain available in the retained payload.
+
+| Product / endpoint | Response families and relevant fields | Normalized destination | UI / analytics destinations |
+|---|---|---|---|
+| Spot `GET /api/v3/account` | maker/taker commission, buyer/seller commission, canTrade/canWithdraw/canDeposit, updateTime, accountType, balances `{asset, free, locked}` | `account_snapshots`, `balances` | Portfolio balances, permissions, concentration, equity inputs |
+| Spot `GET /api/v3/allOrders`, `openOrders` | symbol, orderId, clientOrderId, price, origQty, executedQty, cummulativeQuoteQty, status, time, updateTime, side, type, timeInForce, stopPrice, icebergQty, isWorking, selfTradePreventionMode | `orders` | Orders & Executions, order timeline, execution quality |
+| Spot `GET /api/v3/myTrades` | symbol, id, orderId, orderListId, price, qty, quoteQty, commission, commissionAsset, time, isBuyer, isMaker, isBestMatch | `executions`, `commissions` | Trade drawer, FIFO lots, fees, slippage, maker/taker |
+| Spot `GET /sapi/v1/capital/deposit/hisrec` | id, txId, amount, coin, network, status, address, addressTag, insertTime, completeTime, transferType, travelRuleStatus | `deposits` | Portfolio flows, raw financial events |
+| Spot `GET /sapi/v1/capital/withdraw/history` | id, txId, amount, transactionFee, coin, status, applyTime, completeTime, network, address, transferType | `withdrawals` | Portfolio flows, cost basis boundaries |
+| Wallet `/sapi/v1/asset/transfer`, `/sapi/v1/asset/assetDividend` | tranId, fromSymbol, toSymbol, amount, asset, qty, divTime, enInfo, tranId | `internal_transfers`, `conversions`, `dividends` | Financial events, portfolio cost basis |
+| USDⓈ-M `/fapi/v3/account` | totalWalletBalance, totalUnrealizedProfit, totalMarginBalance, totalInitialMargin, totalMaintMargin, totalPositionInitialMargin, totalOpenOrderInitialMargin, totalCrossWalletBalance, totalCrossUnPnl, availableBalance, maxWithdrawAmount, assets, positions | `account_snapshots`, `balances`, `positions` | Portfolio, Positions & Risk, margin utilization |
+| USDⓈ-M `/fapi/v1/allOrders`, `/fapi/v1/userTrades` | order fields plus activatePrice, priceRate, reduceOnly, closePosition, positionSide, realizedPnl, quoteQty, commission, commissionAsset, buyer, maker | `orders`, `executions`, `realized_income`, `commissions` | Order lifecycle, completed trades, funding/P&L |
+| USDⓈ-M `/fapi/v3/positionRisk` | symbol, positionAmt, entryPrice, breakEvenPrice, markPrice, unRealizedProfit, liquidationPrice, leverage, maxNotionalValue, marginType, isolatedMargin, isAutoAddMargin, positionSide, notional, updateTime | `positions`, `position_snapshots` | Positions & Risk, exposure, liquidation distance |
+| USDⓈ-M `/fapi/v1/income` | symbol, incomeType, income, asset, info, time, tranId, tradeId | `financial_events` | Funding, commissions, realized P&L, transfers, income audit |
+| COIN-M `/dapi/v1/account`, `/dapi/v1/positionRisk` | walletBalance, crossWalletBalance, availableBalance, maxWithdrawAmount, marginBalance, maintMargin, initialMargin, unrealizedPnL; symbol, pair, positionAmt, entryPrice, markPrice, unrealizedProfit, liquidationPrice, leverage, marginType, positionSide, notionalValue | `account_snapshots`, `balances`, `positions`, `position_snapshots` | Inverse portfolio/risk with contract-size and settlement-asset accounting |
+| COIN-M `/dapi/v1/allOrders`, `/dapi/v1/userTrades`, `/dapi/v1/income` | order/execution/income fields plus pair, contractType, contractStatus, baseAsset, quoteAsset, marginAsset, realizedPnl | `orders`, `executions`, `financial_events` | Inverse trade reconstruction, funding, settlement |
+| Margin `/sapi/v1/margin/account`, orders/trades, interest history | totalAssetOfBtc, totalLiabilityOfBtc, totalNetAssetOfBtc, userAssets `{asset, borrowed, free, interest, locked, netAsset}`, liability, interest, principal, interestRate | Not ingested by this integration | Margin endpoints are outside the supported Spot, USDⓈ-M, and COIN-M connection choices |
+| Public Spot `/api/v3/klines`, ticker, aggTrades | openTime, OHLCV, closeTime, quote volume, trade count, taker buy base/quote volume; bid/ask, last price, weighted average | `candles`, `market_observations` | Market context, slippage, volatility, price charts |
+| Public Futures `/fapi/v1/klines`, `/dapi/v1/klines`, mark price, funding, open interest, global/top long-short, taker volume, basis | OHLCV; markPrice, indexPrice, estimatedSettlePrice; fundingRate, fundingTime; openInterest, sumOpenInterest; long/short ratios; buy/sell volumes; basis timestamps/prices | `candles`, `market_observations`, `funding_rates`, `open_interest`, `sentiment_observations`, `basis_observations` | Market Context, funding impact, basis, participation, regime |
+
+## Cross-cutting rules
+
+- `source_endpoint`, request window, response timestamp, account/product, HTTP metadata, raw JSON, and sync run ID are retained for every record.
+- IDs use source-specific namespaces; dedupe keys never assume Spot and Futures IDs are globally unique.
+- Binance history limits are recorded in coverage; missing historical snapshots remain gaps.
+- API fields are not silently coerced to zero. Unsupported, absent, or non-convertible values are `null` with a quality/reason code.
+- All raw records are inspectable from their normalized record and exportable without credentials.
+- Private account, order, trade, income, and wallet-history requests are `USER_DATA` requests signed with the API secret. A read-only API key with the corresponding account-data permission is required; no `TRADE` or withdrawal permission is used.
+- Spot account history uses `GET /api/v3/account`, `/api/v3/openOrders`, `/api/v3/allOrders`, and `/api/v3/myTrades`. USDⓈ-M account/position state uses `/fapi/v3/account` and `/fapi/v3/positionRisk`; COIN-M uses `/dapi/v1/account` and `/dapi/v1/positionRisk`.
+- Order history is paged by `orderId`; trade history is paged by `fromId`; futures income uses `startTime`/`endTime`. Wallet-history endpoints use their supported time window and `limit`. Subsequent scans overlap their previous cursor and upsert on stable account/product/type/exchange identifiers.
+- Binance requires a symbol for `allOrders` and `myTrades` (and futures equivalents). Symbol discovery is based on current balances, positions, and open orders, so history for symbols no longer represented there is reported as incomplete rather than claimed complete. Current account endpoints do not provide historical balance snapshots.
